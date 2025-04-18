@@ -8,11 +8,14 @@ import threading
 from datetime import datetime
 from config import ASSEMBLYAI_API_KEY
 import platform
+import keyboard  # Cross-platform keyboard input
+import time
 
 class AudioRecorder:
     def __init__(self, assemblyai_api_key):
         self.assemblyai_api_key = assemblyai_api_key
         self.recording = False
+        self.paused = False  # New pause state
         self.audio_data = []
         self.sample_rate = 48000
         self.audio_queue = queue.Queue()
@@ -131,7 +134,7 @@ class AudioRecorder:
                     self.audio_queue.put(('system', data))
                 
                 # Create two input streams with optimized settings
-                blocksize = 2048  # Larger block size for better processing
+                blocksize = 2048
                 with sd.InputStream(
                     samplerate=self.sample_rate,
                     device=self.mic_id,
@@ -147,14 +150,34 @@ class AudioRecorder:
                     blocksize=blocksize,
                     dtype=np.float32
                 ):
-                    print("Recording started... Press Enter to stop.")
+                    print("Recording started... Press 'p' to pause, 'r' to resume, or 's' to stop.")
                     print("Recording from both microphone and system audio...")
+                    
+                    # Set up keyboard hooks
+                    keyboard.on_press_key('p', lambda _: self.pause_recording() if not self.paused else None)
+                    keyboard.on_press_key('r', lambda _: self.resume_recording() if self.paused else None)
+                    keyboard.on_press_key('s', lambda _: setattr(self, 'recording', False))
                     
                     mic_buffer = []
                     system_buffer = []
                     
+                    # Variables for silence detection
+                    silence_threshold = 0.001  # Adjust this value based on your needs
+                    silence_start_time = None
+                    silence_duration = 0
+                    last_check_time = time.time()
+                    
+                    # Variables for time-based check
+                    recording_start_time = time.time()
+                    hour_prompt_shown = False
+                    
                     while self.recording:
                         try:
+                            # Skip processing if paused
+                            if self.paused:
+                                time.sleep(0.1)  # Reduce CPU usage while paused
+                                continue
+                            
                             source, audio_data = self.audio_queue.get(timeout=0.1)
                             
                             if source == 'mic':
@@ -184,6 +207,38 @@ class AudioRecorder:
                                 sys_level = np.sqrt(np.mean(sys_data**2))
                                 print(f"\rMic level: {mic_level:.6f}, System level: {sys_level:.6f}", end='', flush=True)
                                 
+                                # Check for silence
+                                current_time = time.time()
+                                if mic_level < silence_threshold and sys_level < silence_threshold:
+                                    if silence_start_time is None:
+                                        silence_start_time = current_time
+                                    silence_duration = current_time - silence_start_time
+                                else:
+                                    silence_start_time = None
+                                    silence_duration = 0
+                                
+                                # Check if we should prompt to stop due to silence
+                                if silence_duration >= 120:  # 2 minutes of silence
+                                    print("\n\nNo sound detected for 2 minutes. Would you like to stop recording? (y/n)")
+                                    response = input().lower()
+                                    if response == 'y':
+                                        self.recording = False
+                                        break
+                                    else:
+                                        silence_start_time = None  # Reset silence timer
+                                        silence_duration = 0
+                                
+                                # Check if we should prompt to stop due to time
+                                recording_duration = current_time - recording_start_time
+                                if recording_duration >= 3600 and not hour_prompt_shown:  # 1 hour
+                                    print("\n\nRecording has been going on for an hour. Would you like to continue? (y/n)")
+                                    response = input().lower()
+                                    if response == 'n':
+                                        self.recording = False
+                                        break
+                                    else:
+                                        hour_prompt_shown = True  # Only show once per hour
+                                
                                 file.write(mixed_audio)
                                 
                                 # Clear buffers
@@ -195,6 +250,9 @@ class AudioRecorder:
                         except Exception as e:
                             print(f"\nError writing audio data: {e}")
                             continue
+                    
+                    # Clean up keyboard hooks
+                    keyboard.unhook_all()
                             
             print("\nRecording finished.")
             
@@ -245,10 +303,17 @@ class AudioRecorder:
         record_thread = threading.Thread(target=self.record)
         record_thread.start()
         
-        # Wait for Enter key to stop
-        input()
-        self.recording = False
+        # Wait for recording to complete
         record_thread.join()
+        
+        # Generate transcript if we have a valid audio file
+        if hasattr(self, 'filepath') and self.filepath:
+            print("\nTranscribing audio...")
+            transcript = self.transcribe_audio(self.filepath)
+            
+            if transcript:
+                # Save and display the formatted transcript
+                self.save_transcript(transcript, self.filepath)
         
         return self.filepath
 
@@ -258,13 +323,13 @@ class AudioRecorder:
             return None
 
         try:
-            # Step 1: Create a 20-second preview clip
+            # Step 1: Create a 2-minute preview clip
             print("\nCreating preview clip...")
             preview_file = audio_file.replace(".wav", "_preview.wav")
             
-            # Read the first 20 seconds of the audio file
+            # Read the first 2 minutes of the audio file
             with sf.SoundFile(audio_file, 'r') as f:
-                preview_data = f.read(int(20 * self.sample_rate))
+                preview_data = f.read(int(120 * self.sample_rate))  # 2 minutes = 120 seconds
             
             # Save the preview clip
             with sf.SoundFile(preview_file, 'w', 
@@ -283,8 +348,77 @@ class AudioRecorder:
             preview_transcript = aai.Transcriber().transcribe(preview_file, config=config)
             
             # Step 3: Get speaker names from preview
-            print("\n=== Preview Transcript (First 20 seconds) ===\n")
-            self.show_preview_and_get_names(preview_transcript)
+            print("\n=== Preview Transcript (First 2 minutes) ===\n")
+            
+            # Find the longest continuous speech for each speaker
+            speaker_segments = {}
+            current_speaker = None
+            current_start = None
+            current_text = []
+            
+            for utterance in preview_transcript.utterances:
+                if current_speaker is None:
+                    current_speaker = utterance.speaker
+                    current_start = utterance.start
+                    current_text = [utterance.text]
+                elif utterance.speaker == current_speaker:
+                    current_text.append(utterance.text)
+                else:
+                    # Store the previous segment
+                    duration = utterance.start - current_start
+                    if current_speaker not in speaker_segments or duration > speaker_segments[current_speaker]['duration']:
+                        speaker_segments[current_speaker] = {
+                            'start': current_start,
+                            'duration': duration,
+                            'text': ' '.join(current_text)
+                        }
+                    
+                    # Start new segment
+                    current_speaker = utterance.speaker
+                    current_start = utterance.start
+                    current_text = [utterance.text]
+            
+            # Don't forget the last segment
+            if current_speaker is not None:
+                duration = preview_transcript.utterances[-1].end - current_start
+                if current_speaker not in speaker_segments or duration > speaker_segments[current_speaker]['duration']:
+                    speaker_segments[current_speaker] = {
+                        'start': current_start,
+                        'duration': duration,
+                        'text': ' '.join(current_text)
+                    }
+            
+            # Format and display the longest segments
+            def format_time(start_ms):
+                seconds = int(start_ms / 1000)
+                minutes = seconds // 60
+                seconds = seconds % 60
+                return f"[{minutes:02d}:{seconds:02d}]"
+            
+            print("\nLongest continuous speech segments from each speaker:")
+            for speaker, segment in speaker_segments.items():
+                timestamp = format_time(segment['start'])
+                print(f"\n{timestamp} {speaker}:")
+                print(f"    {segment['text']}\n")
+            
+            # Get names for each speaker
+            print("\nBased on the preview above, please provide names for each speaker:")
+            self.speaker_names = {}
+            
+            for speaker in sorted(speaker_segments.keys()):
+                while True:
+                    name = input(f"Enter name for {speaker}: ").strip()
+                    if name:
+                        self.speaker_names[speaker] = name
+                        break
+                    print("Please enter a valid name.")
+            
+            # Show the mapping
+            print("\nSpeaker mapping:")
+            for speaker, name in self.speaker_names.items():
+                print(f"{speaker} → {name}")
+            
+            print("\nThese names will be used for the full transcription.")
             
             # Step 4: Transcribe the full audio with the same speaker mapping
             print("\nTranscribing full audio...")
@@ -301,49 +435,6 @@ class AudioRecorder:
         except Exception as e:
             print(f"Error during transcription: {str(e)}")
             return None
-
-    def show_preview_and_get_names(self, transcript):
-        """Show preview transcript and get speaker names"""
-        # Format timestamp
-        def format_time(start_ms):
-            seconds = int(start_ms / 1000)
-            minutes = seconds // 60
-            seconds = seconds % 60
-            return f"[{minutes:02d}:{seconds:02d}]"
-        
-        # Get unique speakers in the preview
-        preview_speakers = set()
-        preview_lines = []
-        
-        # Show the preview conversation
-        for utterance in transcript.utterances:
-            speaker = utterance.speaker
-            preview_speakers.add(speaker)
-            timestamp = format_time(utterance.start)
-            preview_lines.append(f"{timestamp} {speaker}:")
-            preview_lines.append(f"    {utterance.text}\n")
-        
-        # Print the preview
-        print("\n".join(preview_lines))
-        
-        # Get names for each speaker
-        print("\nBased on the preview above, please provide names for each speaker:")
-        self.speaker_names = {}
-        
-        for speaker in sorted(preview_speakers):
-            while True:
-                name = input(f"Enter name for {speaker}: ").strip()
-                if name:
-                    self.speaker_names[speaker] = name
-                    break
-                print("Please enter a valid name.")
-        
-        # Show the mapping
-        print("\nSpeaker mapping:")
-        for speaker, name in self.speaker_names.items():
-            print(f"{speaker} → {name}")
-        
-        print("\nThese names will be used for the full transcription.")
 
     def format_transcript(self, transcript):
         """Format the transcript like a script with real names and timestamps"""
@@ -400,15 +491,31 @@ class AudioRecorder:
             
             print(f"\nTranscript saved to {transcript_file}")
             
-            # Also print the transcript to console with some formatting
+            # Only show the full transcript, not the preview
             print("\n" + "="*50)
-            print("TRANSCRIPT:")
+            print("FULL TRANSCRIPT:")
             print("="*50)
             print(transcript)
             print("="*50 + "\n")
             
         except Exception as e:
             print(f"Error saving transcript: {str(e)}")
+
+    def pause_recording(self):
+        """Pause the current recording"""
+        if self.recording and not self.paused:
+            self.paused = True
+            print("\nRecording paused. Press 'r' to resume or 's' to stop.")
+            return True
+        return False
+
+    def resume_recording(self):
+        """Resume a paused recording"""
+        if self.recording and self.paused:
+            self.paused = False
+            print("\nRecording resumed.")
+            return True
+        return False
 
 def main():
     print("\nStarting program...")
