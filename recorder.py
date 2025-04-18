@@ -15,7 +15,7 @@ class AudioRecorder:
     def __init__(self, assemblyai_api_key):
         self.assemblyai_api_key = assemblyai_api_key
         self.recording = False
-        self.paused = False  # New pause state
+        self.paused = False
         self.audio_data = []
         self.sample_rate = 48000
         self.audio_queue = queue.Queue()
@@ -32,48 +32,63 @@ class AudioRecorder:
             # Print available devices
             print("\nAvailable audio devices:")
             for i, device in enumerate(devices):
-                print(f"{i}: {device['name']} (Input channels: {device.get('max_input_channels', 0)})")
+                # Handle different device info formats across platforms
+                if isinstance(device, dict):
+                    name = device.get('name', f'Device {i}')
+                    channels = device.get('max_input_channels', 0)
+                else:
+                    name = str(device)
+                    channels = 1  # Default to mono if we can't determine channels
+                print(f"{i}: {name} (Input channels: {channels})")
             
-            # Find microphone (not Stereo Mix)
-            self.mic_id = None
-            for i, device in enumerate(devices):
-                if device.get('max_input_channels', 0) > 0:
-                    name = device['name'].lower()
-                    if 'stereo mix' not in name and 'what u hear' not in name:
-                        self.mic_id = i
-                        print(f"\nFound microphone: {device['name']}")
-                        break
+            # Get default input device
+            self.mic_id = sd.default.device[0]  # First element is input device
+            mic_info = sd.query_devices(self.mic_id)
             
-            if self.mic_id is None:
-                raise Exception("No microphone found")
+            # Handle different device info formats
+            if isinstance(mic_info, dict):
+                mic_name = mic_info.get('name', 'Default Microphone')
+                self.mic_channels = mic_info.get('max_input_channels', 1)
+            else:
+                mic_name = str(mic_info)
+                self.mic_channels = 1
+                
+            print(f"\nUsing default input device: {mic_name}")
             
-            # Find Stereo Mix
+            # Find system audio device (Stereo Mix/What U Hear)
             self.system_id = None
             for i, device in enumerate(devices):
-                if device.get('max_input_channels', 0) > 0:
-                    name = device['name'].lower()
-                    if 'stereo mix' in name or 'what u hear' in name:
+                # Handle different device info formats
+                if isinstance(device, dict):
+                    channels = device.get('max_input_channels', 0)
+                    name = device.get('name', '').lower()
+                else:
+                    channels = 1
+                    name = str(device).lower()
+                    
+                if channels > 0:
+                    if 'stereo mix' in name or 'what u hear' in name or 'system' in name:
                         self.system_id = i
-                        print(f"Found Stereo Mix: {device['name']}")
+                        print(f"Found system audio device: {name}")
                         break
             
             if self.system_id is None:
-                print("\nWarning: Stereo Mix not found. Please enable it in Windows sound settings:")
-                print("1. Right-click the speaker icon in taskbar")
-                print("2. Open Sound settings")
-                print("3. Click 'Sound Control Panel'")
-                print("4. In Recording tab, right-click and enable 'Show Disabled Devices'")
-                print("5. Right-click 'Stereo Mix' and select 'Enable'")
-                print("Note: You can still record from your microphone only")
+                print("\nWarning: System audio device not found. You can still record from your microphone.")
+                if self.system == 'Windows':
+                    print("To enable system audio recording on Windows:")
+                    print("1. Right-click the speaker icon in taskbar")
+                    print("2. Open Sound settings")
+                    print("3. Click 'Sound Control Panel'")
+                    print("4. In Recording tab, right-click and enable 'Show Disabled Devices'")
+                    print("5. Right-click 'Stereo Mix' and select 'Enable'")
             
-            # Get device info for channels
-            mic_info = sd.query_devices(self.mic_id)
-            self.mic_channels = mic_info['max_input_channels']
-            print(f"\nMicrophone channels: {self.mic_channels}")
-            
+            # Get system device channels if available
             if self.system_id is not None:
                 sys_info = sd.query_devices(self.system_id)
-                self.sys_channels = sys_info['max_input_channels']
+                if isinstance(sys_info, dict):
+                    self.sys_channels = sys_info.get('max_input_channels', 1)
+                else:
+                    self.sys_channels = 1
                 print(f"System audio channels: {self.sys_channels}")
             else:
                 self.sys_channels = 0
@@ -103,30 +118,17 @@ class AudioRecorder:
         try:
             # Get device info to check channels
             mic_info = sd.query_devices(self.mic_id)
-            sys_info = sd.query_devices(self.system_id)
+            sys_info = sd.query_devices(self.system_id) if self.system_id is not None else None
             
-            # OS-specific handling of device info
-            if self.system == 'Windows':
-                # Windows typically returns a dictionary
+            # Handle device info across platforms
+            if isinstance(mic_info, dict):
                 mic_channels = mic_info.get('max_input_channels', 1)
-                sys_channels = sys_info.get('max_input_channels', 1)
-            elif self.system == 'Linux':
-                # Linux might return a tuple or dictionary depending on the audio backend
-                if isinstance(mic_info, dict):
-                    mic_channels = mic_info.get('max_input_channels', 1)
-                else:
-                    mic_channels = 1
-                if isinstance(sys_info, dict):
-                    sys_channels = sys_info.get('max_input_channels', 1)
-                else:
-                    sys_channels = 1
-            elif self.system == 'Darwin':  # macOS
-                # macOS typically returns a dictionary
-                mic_channels = mic_info.get('max_input_channels', 1)
+            else:
+                mic_channels = 1
+                
+            if sys_info is not None and isinstance(sys_info, dict):
                 sys_channels = sys_info.get('max_input_channels', 1)
             else:
-                # Fallback for unknown OS
-                mic_channels = 1
                 sys_channels = 1
             
             print(f"Operating System: {self.system}")
@@ -135,146 +137,167 @@ class AudioRecorder:
             
             with sf.SoundFile(self.filepath, mode='x', 
                             samplerate=self.sample_rate,
-                            channels=2,
-                            subtype='PCM_24') as file:  # Using 24-bit audio instead of 16-bit
+                            channels=4,
+                            subtype='PCM_24') as file:
                 
                 def mic_callback(indata, frames, time, status):
                     if status:
                         print(f"Mic status: {status}")
                     data = indata.copy()
-                    if data.shape[1] == 1:
-                        data = np.repeat(data, 2, axis=1)
                     self.audio_queue.put(('mic', data))
                 
                 def system_callback(indata, frames, time, status):
                     if status:
                         print(f"System status: {status}")
                     data = indata.copy()
-                    if data.shape[1] == 1:
-                        data = np.repeat(data, 2, axis=1)
+                    # Upmix stereo to 4 channels
+                    if data.shape[1] == 2:
+                        data = np.column_stack((data, data))
+                    elif data.shape[1] == 1:
+                        data = np.repeat(data, 4, axis=1)
                     self.audio_queue.put(('system', data))
                 
-                # Create two input streams with optimized settings
+                # Create input streams with optimized settings
                 blocksize = 2048
-                with sd.InputStream(
+                streams = []
+                
+                # Always create microphone stream
+                streams.append(sd.InputStream(
                     samplerate=self.sample_rate,
                     device=self.mic_id,
                     channels=mic_channels,
                     callback=mic_callback,
                     blocksize=blocksize,
-                    dtype=np.float32  # Use 32-bit float for better quality
-                ), sd.InputStream(
-                    samplerate=self.sample_rate,
-                    device=self.system_id,
-                    channels=sys_channels,
-                    callback=system_callback,
-                    blocksize=blocksize,
                     dtype=np.float32
-                ):
-                    print("Recording started... Press 'p' to pause, 'r' to resume, or 's' to stop.")
-                    print("Recording from both microphone and system audio...")
-                    
-                    # Set up keyboard hooks
-                    keyboard.on_press_key('p', lambda _: self.pause_recording() if not self.paused else None)
-                    keyboard.on_press_key('r', lambda _: self.resume_recording() if self.paused else None)
-                    keyboard.on_press_key('s', lambda _: setattr(self, 'recording', False))
-                    
-                    mic_buffer = []
-                    system_buffer = []
-                    
-                    # Variables for silence detection
-                    silence_threshold = 0.001  # Adjust this value based on your needs
-                    silence_start_time = None
-                    silence_duration = 0
-                    last_check_time = time.time()
-                    
-                    # Variables for time-based check
-                    recording_start_time = time.time()
-                    hour_prompt_shown = False
-                    
-                    while self.recording:
-                        try:
-                            # Skip processing if paused
-                            if self.paused:
-                                time.sleep(0.1)  # Reduce CPU usage while paused
-                                continue
+                ))
+                
+                # Add system audio stream if available
+                if self.system_id is not None:
+                    streams.append(sd.InputStream(
+                        samplerate=self.sample_rate,
+                        device=self.system_id,
+                        channels=sys_channels,
+                        callback=system_callback,
+                        blocksize=blocksize,
+                        dtype=np.float32
+                    ))
+                
+                # Start all streams
+                for stream in streams:
+                    stream.start()
+                
+                print("Recording started... Press 'p' to pause, 'r' to resume, or 's' to stop.")
+                print("Recording from microphone" + (" and system audio" if self.system_id is not None else " only"))
+                
+                # Set up keyboard hooks
+                keyboard.on_press_key('p', lambda _: self.pause_recording() if not self.paused else None)
+                keyboard.on_press_key('r', lambda _: self.resume_recording() if self.paused else None)
+                keyboard.on_press_key('s', lambda _: setattr(self, 'recording', False))
+                
+                mic_buffer = []
+                system_buffer = []
+                
+                # Variables for silence detection
+                silence_threshold = 0.001  # Adjust this value based on your needs
+                silence_start_time = None
+                silence_duration = 0
+                last_check_time = time.time()
+                
+                # Variables for time-based check
+                recording_start_time = time.time()
+                hour_prompt_shown = False
+                
+                while self.recording:
+                    try:
+                        # Skip processing if paused
+                        if self.paused:
+                            time.sleep(0.1)  # Reduce CPU usage while paused
+                            continue
+                        
+                        source, audio_data = self.audio_queue.get(timeout=0.1)
+                        
+                        if source == 'mic':
+                            mic_buffer.append(audio_data)
+                        else:
+                            system_buffer.append(audio_data)
                             
-                            source, audio_data = self.audio_queue.get(timeout=0.1)
+                        # Process buffers when we have enough data
+                        if mic_buffer and system_buffer:
+                            # Get the minimum length between the two buffers
+                            mic_data = np.concatenate(mic_buffer)
+                            sys_data = np.concatenate(system_buffer)
                             
-                            if source == 'mic':
-                                mic_buffer.append(audio_data)
+                            # Ensure system audio has 4 channels
+                            if sys_data.shape[1] != 4:
+                                if sys_data.shape[1] == 2:
+                                    sys_data = np.column_stack((sys_data, sys_data))
+                                elif sys_data.shape[1] == 1:
+                                    sys_data = np.repeat(sys_data, 4, axis=1)
+                            
+                            min_len = min(len(mic_data), len(sys_data))
+                            
+                            # Trim both to the same length
+                            mic_data = mic_data[:min_len]
+                            sys_data = sys_data[:min_len]
+                            
+                            # Apply gentle noise reduction to mic input
+                            mic_data = self.reduce_noise(mic_data)
+                            
+                            # Mix audio with improved balance
+                            mixed_audio = self.mix_audio(mic_data, sys_data)
+                            
+                            # Calculate and show levels
+                            mic_level = np.sqrt(np.mean(mic_data**2))
+                            sys_level = np.sqrt(np.mean(sys_data**2))
+                            print(f"\rMic level: {mic_level:.6f}, System level: {sys_level:.6f}", end='', flush=True)
+                            
+                            # Check for silence
+                            current_time = time.time()
+                            if mic_level < silence_threshold and sys_level < silence_threshold:
+                                if silence_start_time is None:
+                                    silence_start_time = current_time
+                                silence_duration = current_time - silence_start_time
                             else:
-                                system_buffer.append(audio_data)
-                                
-                            # Process buffers when we have enough data
-                            if mic_buffer and system_buffer:
-                                # Get the minimum length between the two buffers
-                                mic_data = np.concatenate(mic_buffer)
-                                sys_data = np.concatenate(system_buffer)
-                                min_len = min(len(mic_data), len(sys_data))
-                                
-                                # Trim both to the same length
-                                mic_data = mic_data[:min_len]
-                                sys_data = sys_data[:min_len]
-                                
-                                # Apply gentle noise reduction to mic input
-                                mic_data = self.reduce_noise(mic_data)
-                                
-                                # Mix audio with improved balance
-                                mixed_audio = self.mix_audio(mic_data, sys_data)
-                                
-                                # Calculate and show levels
-                                mic_level = np.sqrt(np.mean(mic_data**2))
-                                sys_level = np.sqrt(np.mean(sys_data**2))
-                                print(f"\rMic level: {mic_level:.6f}, System level: {sys_level:.6f}", end='', flush=True)
-                                
-                                # Check for silence
-                                current_time = time.time()
-                                if mic_level < silence_threshold and sys_level < silence_threshold:
-                                    if silence_start_time is None:
-                                        silence_start_time = current_time
-                                    silence_duration = current_time - silence_start_time
-                                else:
-                                    silence_start_time = None
-                                    silence_duration = 0
-                                
-                                # Check if we should prompt to stop due to silence
-                                if silence_duration >= 120:  # 2 minutes of silence
-                                    print("\n\nNo sound detected for 2 minutes. Would you like to stop recording? (y/n)")
-                                    response = input().lower()
-                                    if response == 'y':
-                                        self.recording = False
-                                        break
-                                    else:
-                                        silence_start_time = None  # Reset silence timer
-                                        silence_duration = 0
-                                
-                                # Check if we should prompt to stop due to time
-                                recording_duration = current_time - recording_start_time
-                                if recording_duration >= 3600 and not hour_prompt_shown:  # 1 hour
-                                    print("\n\nRecording has been going on for an hour. Would you like to continue? (y/n)")
-                                    response = input().lower()
-                                    if response == 'n':
-                                        self.recording = False
-                                        break
-                                    else:
-                                        hour_prompt_shown = True  # Only show once per hour
-                                
-                                file.write(mixed_audio)
-                                
-                                # Clear buffers
-                                mic_buffer = []
-                                system_buffer = []
-                                
-                        except queue.Empty:
-                            continue
-                        except Exception as e:
-                            print(f"\nError writing audio data: {e}")
-                            continue
-                    
-                    # Clean up keyboard hooks
-                    keyboard.unhook_all()
+                                silence_start_time = None
+                                silence_duration = 0
                             
+                            # Check if we should prompt to stop due to silence
+                            if silence_duration >= 120:  # 2 minutes of silence
+                                print("\n\nNo sound detected for 2 minutes. Would you like to stop recording? (y/n)")
+                                response = input().lower()
+                                if response == 'y':
+                                    self.recording = False
+                                    break
+                                else:
+                                    silence_start_time = None  # Reset silence timer
+                                    silence_duration = 0
+                            
+                            # Check if we should prompt to stop due to time
+                            recording_duration = current_time - recording_start_time
+                            if recording_duration >= 3600 and not hour_prompt_shown:  # 1 hour
+                                print("\n\nRecording has been going on for an hour. Would you like to continue? (y/n)")
+                                response = input().lower()
+                                if response == 'n':
+                                    self.recording = False
+                                    break
+                                else:
+                                    hour_prompt_shown = True  # Only show once per hour
+                            
+                            file.write(mixed_audio)
+                            
+                            # Clear buffers
+                            mic_buffer = []
+                            system_buffer = []
+                            
+                    except queue.Empty:
+                        continue
+                    except Exception as e:
+                        print(f"\nError writing audio data: {e}")
+                        continue
+                
+                # Clean up keyboard hooks
+                keyboard.unhook_all()
+                
             print("\nRecording finished.")
             
         except Exception as e:
