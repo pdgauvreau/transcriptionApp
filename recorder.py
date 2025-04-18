@@ -105,10 +105,31 @@ class AudioRecorder:
             mic_info = sd.query_devices(self.mic_id)
             sys_info = sd.query_devices(self.system_id)
             
-            # Use the actual number of input channels for each device
-            mic_channels = mic_info['max_input_channels']
-            sys_channels = sys_info['max_input_channels']
+            # OS-specific handling of device info
+            if self.system == 'Windows':
+                # Windows typically returns a dictionary
+                mic_channels = mic_info.get('max_input_channels', 1)
+                sys_channels = sys_info.get('max_input_channels', 1)
+            elif self.system == 'Linux':
+                # Linux might return a tuple or dictionary depending on the audio backend
+                if isinstance(mic_info, dict):
+                    mic_channels = mic_info.get('max_input_channels', 1)
+                else:
+                    mic_channels = 1
+                if isinstance(sys_info, dict):
+                    sys_channels = sys_info.get('max_input_channels', 1)
+                else:
+                    sys_channels = 1
+            elif self.system == 'Darwin':  # macOS
+                # macOS typically returns a dictionary
+                mic_channels = mic_info.get('max_input_channels', 1)
+                sys_channels = sys_info.get('max_input_channels', 1)
+            else:
+                # Fallback for unknown OS
+                mic_channels = 1
+                sys_channels = 1
             
+            print(f"Operating System: {self.system}")
             print(f"Microphone channels: {mic_channels}")
             print(f"System audio channels: {sys_channels}")
             
